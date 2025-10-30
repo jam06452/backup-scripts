@@ -3,98 +3,32 @@ import os
 import sys
 import subprocess
 import shutil
-import zipfile
 import tempfile
 from pathlib import Path
-from typing import Optional, List
+from typing import List
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import queue
-TARGET_REPO_URL = 'https://github.com/jam06452/LargeFileStorage'
+import json
+import time
+
+REPO_URL = 'https://github.com/jam06452/LargeFileStorage'
 CHUNK_SIZE_MB = 50
 CHUNK_SIZE_BYTES = CHUNK_SIZE_MB * 1024 * 1024
 TEMP_CHUNKS_FOLDER = 'temp_split_chunks'
 BATCH_SIZE = 20
 PUSH_INTERVAL = 30
 MAX_WORKERS = 4
-BYTES_PER_MB = 1024 * 1024
 
 class BackupError(Exception):
     pass
 
-def run_git(cmd: List[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(['git'] + cmd, cwd=cwd, capture_output=True, check=check)
+def log(msg: str) -> None:
+    print(f'  {msg}')
 
-def git_push(repo_path: Path, force: bool = False) -> bool:
-    cmd = ['push', '-u', 'origin', 'master'] if force else ['push']
-    if force:
-        cmd.append('--force')
-    result = run_git(cmd, repo_path, check=False)
-    if result.returncode != 0 and not force:
-        return git_push(repo_path, force=True)
-    return result.returncode == 0
-
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-def create_gitkeep(path: Path) -> None:
-    (path / '.gitkeep').touch()
-
-def extract_folder_parts(source: Path) -> List[str]:
-    try:
-        downloads_index = [p.lower() for p in source.parts].index('downloads')
-        return list(source.parts[downloads_index:])
-    except ValueError:
-        return [source.name]
-
-def setup_git_repo(repo_url: str) -> Path:
-    temp_git_dir = tempfile.mkdtemp(prefix='git_repo_')
-    repo_path = Path(temp_git_dir) / 'repo'
-    ensure_dir(repo_path)
-    try:
-        run_git(['init'], repo_path)
-        run_git(['config', 'user.name', 'backup-bot'], repo_path)
-        run_git(['config', 'user.email', 'backup@bot.local'], repo_path)
-        run_git(['remote', 'add', 'origin', repo_url], repo_path)
-        return repo_path
-    except subprocess.CalledProcessError as e:
-        shutil.rmtree(temp_git_dir)
-        raise BackupError(f'Failed to setup repository: {e.stderr}')
-
-def create_folder_structure(repo_path: Path, folder_parts: List[str]) -> Path:
-    base_dest_path = repo_path
-    for folder_name in folder_parts:
-        base_dest_path = base_dest_path / folder_name
-        ensure_dir(base_dest_path)
-        create_gitkeep(base_dest_path)
-    try:
-        run_git(['add', '-A'], repo_path)
-        run_git(['commit', '-m', f"Create folder structure: {'/'.join(folder_parts)}"], repo_path)
-    except subprocess.CalledProcessError:
-        pass
-    return base_dest_path
-
-def is_large_file(file_path: Path) -> bool:
-    return get_file_size_mb(file_path) > CHUNK_SIZE_MB
-
-def print_header(message: str):
-    print(f"\n{'=' * 70}")
-    print(f'  {message}')
-    print(f"{'=' * 70}\n")
-
-def print_step(step_num: int, message: str):
-    print(f'\n[Step {step_num}] {message}')
-    print('-' * 70)
-
-def print_success(message: str):
-    print(f'[OK] {message}')
-
-def print_error(message: str):
-    print(f'[ERROR] {message}', file=sys.stderr)
-
-def print_info(message: str):
-    print(f'  > {message}')
+def run_cmd(cmd: List[str], cwd=None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, cwd=cwd, check=False)
 
 def get_existing_files_in_repo(repo_url: str, folder_path: str) -> set:
     try:
@@ -117,37 +51,6 @@ def get_existing_files_in_repo(repo_url: str, folder_path: str) -> set:
         print_info(f'Could not check existing files: {e}')
         return set()
 
-def validate_chunks(existing_files: set) -> tuple[set, set]:
-    chunk_groups = {}
-    for filename in existing_files:
-        if '.part' in filename:
-            base_name = filename.rsplit('.part', 1)[0]
-            if base_name not in chunk_groups:
-                chunk_groups[base_name] = []
-            chunk_groups[base_name].append(filename)
-    
-    complete_chunks = set()
-    incomplete_chunks = set()
-    
-    for base_name, chunks in chunk_groups.items():
-        sorted_chunks = sorted(chunks)
-        expected_parts = len(sorted_chunks)
-        is_complete = True
-        
-        for i, chunk in enumerate(sorted_chunks, 1):
-            expected_name = f'{base_name}.part{i:03d}'
-            if chunk != expected_name:
-                is_complete = False
-                break
-        
-        if is_complete:
-            complete_chunks.update(sorted_chunks)
-        else:
-            incomplete_chunks.update(sorted_chunks)
-            print_info(f'Found incomplete chunks for {base_name}, will re-upload')
-    
-    return complete_chunks, incomplete_chunks
-
 def check_gh_cli_installed() -> bool:
     try:
         result = subprocess.run(['gh', '--version'], capture_output=True, text=True, check=False)
@@ -163,7 +66,8 @@ def check_gh_authentication() -> bool:
         return False
 
 def get_file_size_mb(file_path: Path) -> float:
-    return file_path.stat().st_size / BYTES_PER_MB
+    size_bytes = file_path.stat().st_size
+    return size_bytes / (1024 * 1024)
 
 def create_archive(source_folder: Path, output_path: Path) -> None:
     print_info(f'Creating archive: {output_path.name}')
@@ -185,11 +89,13 @@ def create_archive(source_folder: Path, output_path: Path) -> None:
         raise BackupError(f'Failed to create archive: {e}')
 
 def split_file(source_file: Path, output_folder: Path) -> List[Path]:
-    ensure_dir(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
     chunk_files = []
     chunk_num = 1
     file_size = source_file.stat().st_size
     total_chunks = (file_size + CHUNK_SIZE_BYTES - 1) // CHUNK_SIZE_BYTES
+    print_info(f'File size: {get_file_size_mb(source_file):.2f} MB')
+    print_info(f'Will create {total_chunks} chunk(s) of max {CHUNK_SIZE_MB} MB each')
     try:
         with open(source_file, 'rb') as f:
             while True:
@@ -200,8 +106,11 @@ def split_file(source_file: Path, output_folder: Path) -> List[Path]:
                 chunk_path = output_folder / chunk_filename
                 with open(chunk_path, 'wb') as chunk_file:
                     chunk_file.write(chunk_data)
+                chunk_size_mb = len(chunk_data) / (1024 * 1024)
+                print_info(f'Created chunk {chunk_num}/{total_chunks}: {chunk_filename} ({chunk_size_mb:.2f} MB)')
                 chunk_files.append(chunk_path)
                 chunk_num += 1
+        print_success(f'Created {len(chunk_files)} chunk file(s)')
         return chunk_files
     except Exception as e:
         raise BackupError(f'Failed to split file: {e}')
@@ -274,21 +183,49 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
     if temp_folder.exists():
         shutil.rmtree(temp_folder)
     temp_folder.mkdir(exist_ok=True)
-    
-    folder_parts = extract_folder_parts(source)
-    
+    source_parts = source.parts
+    try:
+        downloads_index = [p.lower() for p in source_parts].index('downloads')
+        folder_parts = list(source_parts[downloads_index:])
+    except ValueError:
+        folder_parts = [source.name]
     print_info('Setting up local repository...')
-    repo_path = setup_git_repo(repo_url)
-    print_success('Repository ready')
-    
+    temp_git_dir = tempfile.mkdtemp(prefix='git_repo_')
+    repo_path = Path(temp_git_dir) / 'repo'
+    repo_path.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(['git', 'init'], cwd=repo_path, capture_output=True, check=True)
+        subprocess.run(['git', 'config', 'user.name', 'backup-bot'], cwd=repo_path, capture_output=True, check=True)
+        subprocess.run(['git', 'config', 'user.email', 'backup@bot.local'], cwd=repo_path, capture_output=True, check=True)
+        subprocess.run(['git', 'remote', 'add', 'origin', repo_url], cwd=repo_path, capture_output=True, check=True)
+        print_success('Repository ready')
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(temp_git_dir)
+        raise BackupError(f'Failed to setup repository: {e.stderr}')
     print_info('Creating folder structure locally...')
-    base_dest_path = create_folder_structure(repo_path, folder_parts)
+    base_dest_path = repo_path
+    for (i, folder_name) in enumerate(folder_parts):
+        base_dest_path = base_dest_path / folder_name
+        base_dest_path.mkdir(exist_ok=True)
+        gitkeep = base_dest_path / '.gitkeep'
+        gitkeep.touch()
+        current_path = '/'.join(folder_parts[:i + 1])
+        print_info(f'  Creating: {current_path}')
+    try:
+        subprocess.run(['git', 'add', '-A'], cwd=repo_path, capture_output=True, check=True)
+        subprocess.run(['git', 'commit', '-m', f"Create folder structure: {'/'.join(folder_parts)}"], cwd=repo_path, capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        pass
     print_success(f"Created folder structure: {'/'.join(folder_parts)}")
-    ensure_dir(base_dest_path)
+    print_info('Keeping .gitkeep files at each folder level to preserve visible hierarchy on GitHub')
+    print_info('Keeping marker files (.gitkeep) at each folder level to preserve visible hierarchy on GitHub')
+    base_dest_path.mkdir(parents=True, exist_ok=True)
 
     def uploader_thread():
         batch = []
+        batch_size = 20
         last_push_time = 0
+        push_interval = 30
         try:
             while not upload_complete.is_set() or not upload_queue.empty():
                 try:
@@ -297,25 +234,28 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
                         break
                     (actual_file_path, rel_path, is_temp) = file_info
                     dest_path = base_dest_path / rel_path
-                    ensure_dir(dest_path.parent)
-                    create_gitkeep(dest_path.parent)
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    gitkeep_path = dest_path.parent / '.gitkeep'
+                    if not gitkeep_path.exists():
+                        gitkeep_path.touch()
                     shutil.copy2(actual_file_path, dest_path)
                     batch.append(rel_path)
                     with stats['upload_lock']:
                         stats['files_uploaded'] += 1
                         current_uploaded = stats['files_uploaded']
-                        total = stats['total_files']
-                        progress = (current_uploaded / total * 100) if total > 0 else 0
                     upload_queue.task_done()
                     import time
                     current_time = time.time()
-                    should_push = len(batch) >= BATCH_SIZE or (current_time - last_push_time >= PUSH_INTERVAL and len(batch) > 0) or upload_complete.is_set()
+                    should_push = len(batch) >= batch_size or (current_time - last_push_time >= push_interval and len(batch) > 0) or upload_complete.is_set()
                     if should_push:
                         try:
-                            run_git(['add', '-A'], repo_path)
-                            run_git(['commit', '-m', f'Add {len(batch)} file(s) ({current_uploaded} total)'], repo_path)
-                            git_push(repo_path)
-                            print(f'[UPLOAD] Progress: {progress:.1f}% ({current_uploaded}/{total})')
+                            subprocess.run(['git', 'add', '-A'], cwd=repo_path, capture_output=True, check=True)
+                            commit_msg = f'Add {len(batch)} file(s) ({current_uploaded} total)'
+                            subprocess.run(['git', 'commit', '-m', commit_msg], cwd=repo_path, capture_output=True, check=True)
+                            push_result = subprocess.run(['git', 'push', '-u', 'origin', 'master'], cwd=repo_path, capture_output=True, check=False)
+                            if push_result.returncode != 0:
+                                subprocess.run(['git', 'push', '-u', 'origin', 'master', '--force'], cwd=repo_path, capture_output=True, check=True)
+                            print_info(f'  Pushed {len(batch)} file(s) to GitHub ({current_uploaded} total uploaded)')
                             batch.clear()
                             last_push_time = current_time
                         except subprocess.CalledProcessError as e:
@@ -323,16 +263,15 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
                             break
                 except queue.Empty:
                     import time
-                    if len(batch) > 0 and time.time() - last_push_time >= PUSH_INTERVAL:
+                    if len(batch) > 0 and time.time() - last_push_time >= push_interval:
                         try:
-                            run_git(['add', '-A'], repo_path)
-                            run_git(['commit', '-m', f'Add {len(batch)} file(s)'], repo_path)
-                            git_push(repo_path)
+                            subprocess.run(['git', 'add', '-A'], cwd=repo_path, capture_output=True, check=True)
+                            subprocess.run(['git', 'commit', '-m', f'Add {len(batch)} file(s)'], cwd=repo_path, capture_output=True, check=True)
+                            push_result = subprocess.run(['git', 'push'], cwd=repo_path, capture_output=True, check=False)
+                            if push_result.returncode != 0:
+                                subprocess.run(['git', 'push', '-u', 'origin', 'master', '--force'], cwd=repo_path, capture_output=True, check=True)
                             with stats['upload_lock']:
-                                current_uploaded = stats['files_uploaded']
-                                total = stats['total_files']
-                                progress = (current_uploaded / total * 100) if total > 0 else 0
-                                print(f'[UPLOAD] Progress: {progress:.1f}% ({current_uploaded}/{total})')
+                                print_info(f"  Pushed {len(batch)} file(s) to GitHub ({stats['files_uploaded']} total)")
                             batch.clear()
                             last_push_time = time.time()
                         except:
@@ -340,13 +279,13 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
                     continue
             if len(batch) > 0:
                 try:
-                    run_git(['add', '-A'], repo_path)
-                    run_git(['commit', '-m', f'Add final {len(batch)} file(s)'], repo_path)
-                    git_push(repo_path)
+                    subprocess.run(['git', 'add', '-A'], cwd=repo_path, capture_output=True, check=True)
+                    subprocess.run(['git', 'commit', '-m', f'Add final {len(batch)} file(s)'], cwd=repo_path, capture_output=True, check=True)
+                    push_result = subprocess.run(['git', 'push'], cwd=repo_path, capture_output=True, check=False)
+                    if push_result.returncode != 0:
+                        subprocess.run(['git', 'push', '-u', 'origin', 'master', '--force'], cwd=repo_path, capture_output=True, check=True)
                     with stats['upload_lock']:
-                        current_uploaded = stats['files_uploaded']
-                        total = stats['total_files']
-                        print(f'[UPLOAD] Complete: 100.0% ({current_uploaded}/{total})')
+                        print_info(f"  Pushed final {len(batch)} file(s) to GitHub ({stats['files_uploaded']} total)")
                 except:
                     pass
         except Exception as e:
@@ -356,7 +295,7 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
     if source.is_file():
         stats['total_files'] = 1
         file_size_mb = get_file_size_mb(source)
-        if is_large_file(source):
+        if file_size_mb > CHUNK_SIZE_MB:
             print_info(f'File size: {file_size_mb:.2f} MB - splitting into chunks')
             chunk_files = split_file(source, temp_folder)
             stats['total_files'] = len(chunk_files)
@@ -373,13 +312,6 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
         existing_files_in_repo = get_existing_files_in_repo(repo_url, folder_path)
         if existing_files_in_repo:
             print_info(f'Found {len(existing_files_in_repo)} existing file(s) in repository')
-        
-        complete_chunks, incomplete_chunks = validate_chunks(existing_files_in_repo)
-        valid_files = (existing_files_in_repo - incomplete_chunks) | complete_chunks
-        
-        if incomplete_chunks:
-            print_info(f'Found {len(incomplete_chunks)} incomplete chunk(s), will re-upload')
-        
         all_files = []
         skipped_files = []
         for (root, dirs, files) in os.walk(source):
@@ -389,12 +321,12 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
                 file_path = Path(root) / file
                 file_size_mb = get_file_size_mb(file_path)
                 rel_path = file_path.relative_to(source)
-                if is_large_file(file_path):
+                if file_size_mb > CHUNK_SIZE_MB:
                     chunk_name = f'{file_path.name}.part001'
-                    if chunk_name in valid_files:
+                    if chunk_name in existing_files_in_repo:
                         skipped_files.append(rel_path)
                         continue
-                elif rel_path.name in valid_files:
+                elif rel_path.name in existing_files_in_repo:
                     skipped_files.append(rel_path)
                     continue
                 all_files.append((file_path, rel_path, file_size_mb))
@@ -403,8 +335,8 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
             print_info(f'Skipped {len(skipped_files)} file(s) already in repository')
         if skip_folders:
             print_info(f"Skipped folders: {', '.join(skip_folders)}")
-        small_files = [(fp, rp) for (fp, rp, size) in all_files if not is_large_file(fp)]
-        large_files = [(fp, rp, size) for (fp, rp, size) in all_files if is_large_file(fp)]
+        small_files = [(fp, rp) for (fp, rp, size) in all_files if size <= CHUNK_SIZE_MB]
+        large_files = [(fp, rp, size) for (fp, rp, size) in all_files if size > CHUNK_SIZE_MB]
         stats['total_files'] = len(all_files)
         print_info(f'Uploading {len(small_files)} small file(s) and splitting {len(large_files)} large file(s) concurrently...')
         for (file_path, rel_path) in small_files:
@@ -413,8 +345,9 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
 
             def split_and_queue(file_info):
                 (file_path, rel_path, file_size_mb) = file_info
+                print_info(f'  Splitting: {rel_path} ({file_size_mb:.2f} MB)')
                 chunk_dest_folder = temp_folder / rel_path.parent
-                ensure_dir(chunk_dest_folder)
+                chunk_dest_folder.mkdir(parents=True, exist_ok=True)
                 chunk_files = split_file(file_path, chunk_dest_folder)
                 for chunk in chunk_files:
                     chunk_rel_path = rel_path.parent / chunk.name
@@ -423,7 +356,7 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
                     stats['files_split'] += 1
                     stats['total_files'] += len(chunk_files) - 1
                 return len(chunk_files)
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(split_and_queue, file_info) for file_info in large_files]
                 for future in as_completed(futures):
                     try:
@@ -436,35 +369,109 @@ def process_and_upload_files(source: Path, repo_url: str, skip_folders: List[str
     if upload_error:
         raise BackupError(f'Upload failed: {upload_error[0]}')
     print_success(f"All {stats['files_uploaded']} file(s) uploaded to GitHub")
-    shutil.rmtree(repo_path.parent, ignore_errors=True)
+    shutil.rmtree(temp_git_dir, ignore_errors=True)
     if temp_folder.exists():
         shutil.rmtree(temp_folder, ignore_errors=True)
+    '\n    Process files for upload - only split individual files larger than 50MB.\n    Returns original file paths when possible to avoid duplicating disk space.\n    \n    For folders:\n    - Upload files directly from source folder (no copying)\n    - Only create temporary chunks for files over 50MB\n    \n    Args:\n        source: Source file or folder\n        \n    Returns:\n        Tuple of (temp_chunks_folder, list of (file_path, relative_path) tuples, needs_cleanup)\n    '
+    temp_folder = None
+    files_to_upload = []
+    if source.is_file():
+        file_size_mb = get_file_size_mb(source)
+        if file_size_mb > CHUNK_SIZE_MB:
+            print_info(f'File size: {file_size_mb:.2f} MB - splitting into chunks')
+            temp_folder = source.parent / TEMP_CHUNKS_FOLDER
+            if temp_folder.exists():
+                shutil.rmtree(temp_folder)
+            temp_folder.mkdir(exist_ok=True)
+            chunk_files = split_file(source, temp_folder)
+            for chunk in chunk_files:
+                files_to_upload.append((chunk, Path(chunk.name)))
+        else:
+            print_info(f'File size: {file_size_mb:.2f} MB - uploading directly')
+            files_to_upload.append((source, Path(source.name)))
+        return (temp_folder, files_to_upload, temp_folder is not None)
+    else:
+        print_step(1, 'Analyzing Folder Contents')
+        all_files = []
+        large_files = []
+        for (root, dirs, files) in os.walk(source):
+            for file in files:
+                file_path = Path(root) / file
+                file_size_mb = get_file_size_mb(file_path)
+                rel_path = file_path.relative_to(source)
+                all_files.append((file_path, rel_path, file_size_mb))
+                if file_size_mb > CHUNK_SIZE_MB:
+                    large_files.append((file_path, rel_path, file_size_mb))
+        print_info(f'Found {len(all_files)} file(s) in folder')
+        if large_files:
+            print_info(f'Found {len(large_files)} file(s) over {CHUNK_SIZE_MB} MB - will split only those')
+            temp_folder = source.parent / TEMP_CHUNKS_FOLDER
+            if temp_folder.exists():
+                shutil.rmtree(temp_folder)
+            temp_folder.mkdir(exist_ok=True)
+            split_files = set()
+
+            def split_large_file(file_info):
+                (file_path, rel_path, file_size_mb) = file_info
+                print_info(f'  Splitting: {rel_path} ({file_size_mb:.2f} MB)')
+                chunk_dest_folder = temp_folder / rel_path.parent
+                chunk_dest_folder.mkdir(parents=True, exist_ok=True)
+                chunk_files = split_file(file_path, chunk_dest_folder)
+                chunk_results = []
+                for (i, chunk) in enumerate(chunk_files):
+                    chunk_rel_path = rel_path.parent / chunk.name
+                    chunk_results.append((chunk, chunk_rel_path))
+                return (file_path, chunk_results)
+            print_info(f'Splitting large files concurrently...')
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(split_large_file, file_info): file_info for file_info in large_files}
+                for future in as_completed(futures):
+                    try:
+                        (original_file, chunk_results) = future.result()
+                        split_files.add(original_file)
+                        files_to_upload.extend(chunk_results)
+                    except Exception as e:
+                        (file_path, _, _) = futures[future]
+                        print_error(f'Failed to split {file_path.name}: {e}')
+            print_success(f'Split {len(large_files)} large file(s)')
+        else:
+            print_info(f'All files are under {CHUNK_SIZE_MB} MB - no splitting needed')
+            split_files = set()
+        for (file_path, rel_path, file_size_mb) in all_files:
+            if file_path not in split_files:
+                files_to_upload.append((file_path, rel_path))
+        print_success(f'Prepared {len(files_to_upload)} file(s) for upload')
+        return (temp_folder, files_to_upload, temp_folder is not None)
 
 def backup_to_github(source_path: str, skip_folders: List[str]=None) -> None:
     source = Path(source_path).resolve()
-    if not source.exists():
-        print_error(f'Source does not exist: {source}')
-        sys.exit(1)
-    
-    if not check_gh_cli_installed() or not check_gh_authentication():
-        print_error('GitHub CLI not installed or not authenticated')
-        print_info('Install: https://cli.github.com/ then run: gh auth login')
-        sys.exit(1)
-    
-    print(f'\n[BACKUP] Source: {source.name}')
-    print(f'[BACKUP] Target: {TARGET_REPO_URL}')
-    
     try:
+        print_header('GitHub Chunked Backup Utility')
+        print_info(f'Source: {source}')
+        print_info(f'Target Repository: {TARGET_REPO_URL}')
+        print_info(f'Chunk Size: {CHUNK_SIZE_MB} MB')
+        if not source.exists():
+            raise BackupError(f'Source path does not exist: {source}')
+        print_step(0, 'Pre-flight Checks')
+        if not check_gh_cli_installed():
+            raise BackupError('GitHub CLI (gh) is not installed or not in PATH.\nPlease install it from: https://cli.github.com/\nThen run: gh auth login')
+        print_success('GitHub CLI (gh) is installed')
+        if not check_gh_authentication():
+            raise BackupError('Not authenticated with GitHub CLI.\nPlease run: gh auth login')
+        print_success('GitHub CLI authentication verified')
+        print_step(1, 'Processing and Uploading Files')
         process_and_upload_files(source, TARGET_REPO_URL, skip_folders)
-        print(f'\n[OK] Backup complete!')
+        print_header('Backup Completed Successfully!')
+        print_success(f'Original source preserved: {source}')
+        print_info(f'Repository: {TARGET_REPO_URL}')
     except BackupError as e:
         print_error(str(e))
         sys.exit(1)
     except KeyboardInterrupt:
-        print_error('Cancelled by user')
+        print_error('Backup cancelled by user')
         sys.exit(1)
     except Exception as e:
-        print_error(f'Error: {e}')
+        print_error(f'Unexpected error: {e}')
         sys.exit(1)
 
 def main():
